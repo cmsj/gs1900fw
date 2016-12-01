@@ -4,8 +4,12 @@
 import argparse
 import binascii
 import datetime
+import gzip
+import StringIO
 import struct
 import sys
+
+DEBUG = False
 
 # Operating System Codes
 IH_OS_INVALID = 0    # Invalid OS
@@ -185,13 +189,34 @@ def parse_options(args=None):
     return args
 
 
-def asHex(value):
+def err(msg, shouldexit=True):
+    """Print an error and die"""
+    print "ERROR: %s" % msg
+    if shouldexit:
+        sys.exit(1)
+
+
+def dbg(msg):
+    """Print a debugging message, if appropriate"""
+    if DEBUG:
+        print "DEBUG: %s" % msg
+
+
+def as_hex(value):
     """Turn an integer into a hex string"""
     return format(value, '#02x')
 
-def asBytes(value, length):
+
+def as_bytes(value, length):
     """Turn an integer into a byte array"""
     return value.to_bytes(length, byteorder="big", signed=False)
+
+
+def lookup_magic(lookup, item):
+    """Utility method to use this libraries lookup tables"""
+    if item < 0 or item >= len(lookup):
+        return '<not supported %02X>' % item
+    return lookup[item]
 
 
 class UBootImage(object):
@@ -214,19 +239,21 @@ class UBootImage(object):
         self.raw_header = None  # Raw 64 byte header
         self.raw_image = None  # Raw image
 
-    def lookup_magic(self, lookup, item):
-        """Utility method to use this libraries lookup tables"""
-        if item < 0 or item >= len(lookup):
-            return '<not supported %02X>' % item
-        return lookup[item]
+    def os_name(self):
+        """Look up an OS name"""
+        return lookup_magic(IH_OS_LOOKUP, self.ih_os)
 
-    def os_name(self): return self.lookup_magic(IH_OS_LOOKUP, self.ih_os)
+    def arch_name(self):
+        """Look up an Arch name"""
+        return lookup_magic(IH_ARCH_LOOKUP, self.ih_arch)
 
-    def arch_name(self): return self.lookup_magic(IH_ARCH_LOOKUP, self.ih_arch)
+    def type_name(self):
+        """Look up a type name"""
+        return lookup_magic(IH_TYPE_LOOKUP, self.ih_type)
 
-    def type_name(self): return self.lookup_magic(IH_TYPE_LOOKUP, self.ih_type)
-
-    def comp_name(self): return self.lookup_magic(IH_COMP_LOOKUP, self.ih_comp)
+    def comp_name(self):
+        """Look up a compression name"""
+        return lookup_magic(IH_COMP_LOOKUP, self.ih_comp)
 
     def load_fw(self, filepath):
         """Load a firmware file from disk"""
@@ -252,15 +279,14 @@ class UBootImage(object):
         self.ih_name = header[11]
 
         print("Checking file magic: Expected %s, found %s" % (
-            asHex(IH_MAGIC),
-            asHex(self.ih_magic))
+            as_hex(IH_MAGIC),
+            as_hex(self.ih_magic))
              )
 
     def parse_image(self):
         """Parse the image"""
         if self.ih_type == IH_TYPE_MULTI:
-            print "ERROR: Unable to handle multipart images, sorry!"
-            sys.exit(1)
+            err("ERROR: Unable to handle multipart images, sorry!")
 
         self.parts.append(self.raw_image)
 
@@ -276,31 +302,121 @@ class UBootImage(object):
         info += "Compression type: %s\n" % self.comp_name()
         info += "Architecture: %s\n" % self.arch_name()
         info += "OS: %s\n" % self.os_name()
-        info += "Load address: %s\n" % asHex(self.ih_load)
-        info += "Execution address: %s\n" % asHex(self.ih_ep)
+        info += "Load address: %s\n" % as_hex(self.ih_load)
+        info += "Execution address: %s\n" % as_hex(self.ih_ep)
         return info
 
     def checksums(self):
         """Check the checksums of header and image"""
         success = True
 
-        header_crc = (binascii.crc32(self.raw_header[8:64]) & 0xFFFFFFFF) ^ IH_HCRC_XOR
+        headerpart = self.raw_header[8:64]
+        header_crc = (binascii.crc32(headerpart) & 0xFFFFFFFF) ^ IH_HCRC_XOR
         print("Header checksum: Expected %s, found %s" % (
-            asHex(self.ih_hcrc),
-            asHex(header_crc)))
+            as_hex(self.ih_hcrc),
+            as_hex(header_crc)))
         if self.ih_hcrc != header_crc:
-            self.err("Header CRCs do not match", exit=False)
+            err("Header CRCs do not match", False)
             success = False
 
         image_crc = binascii.crc32(self.parts[0]) & 0xFFFFFFFF
         print("Image checksum: Expected %s, found %s" % (
-            asHex(self.ih_dcrc),
-            asHex(image_crc)))
+            as_hex(self.ih_dcrc),
+            as_hex(image_crc)))
         if self.ih_dcrc != image_crc:
-            self.err("Image CRCs do not match", exit=False)
+            err("Image CRCs do not match", False)
             success = True
 
         return success
+
+    def find_gzip_name(self, partnum):
+        """Attempt to figure out the filename of a given image part"""
+        filename = None
+
+        fileobj = StringIO.StringIO(self.parts[partnum])
+        gzobj = gzip.GzipFile(fileobj=fileobj, mode="rb")
+        gzf = gzobj.fileobj
+
+        gzf.seek(0)
+        magic = gzf.read(2)
+        if magic != '\037\213':
+            err("Part %d is not gzipped" % partnum, False)
+            return filename
+
+        _, flag, _ = struct.unpack("<BBIxx", gzf.read(8))
+
+        if not flag & gzip.FNAME:
+            print "INFO: Part %d does not have a filename" % partnum
+            return filename
+
+        if flag & gzip.FEXTRA:
+            # Read & discard the extra field, if present
+            gzf.read(struct.unpack("<H", gzf.read(2)))
+
+        # Read a null-terminated string containing the filename
+        fname = []
+        while True:
+            fnamebytes = gzf.read(1)
+            if not fnamebytes or fnamebytes == '\000':
+                break
+            fname.append(fnamebytes)
+
+        filename = ''.join(fname)
+        return filename
+
+    def split_fw(self, filepath):
+        """Save the parts of the firmware as files"""
+
+        ext = lookup_magic(IH_COMP_EXT_LOOKUP, self.ih_comp)
+
+        for i in xrange(0, len(self.parts)):
+            print "Examining part: %d" % i
+            filepath_part = filepath + "-part-%d.%s" % (i, ext)
+            with open(filepath_part, "wb") as fwfile:
+                print "  Writing to: %s" % filepath_part
+                fwfile.write(self.parts[i])
+                fwfile.close()
+
+            if self.ih_comp == IH_COMP_GZIP:
+                filename = self.find_gzip_name(i)
+                if filename:
+                    filename = filepath + "-part-%d-%s" % (i, filename)
+                else:
+                    filename = filepath + "-part-%d" % i
+
+                print "  Decompressing to: %s" % filename
+                fileobj = StringIO.StringIO(self.parts[i])
+                gzobj = gzip.GzipFile(fileobj=fileobj, mode="rb")
+                fileobj.seek(0)
+                gzobj.fileobj.seek(0)
+                with open(filename, "wb") as partfile:
+                    try:
+                        partfile.write(gzobj.read())
+                    except IOError:
+                        # Almost certainly not an error, just a gzip module bug
+                        partfile.write(gzobj.extrabuf[gzobj.offset -
+                                                      gzobj.extrastart:])
+
+            if i == 0:
+                # Split the vmlinux_org.bin into kernel and initramfs
+                with open(filename, "rb") as vmfile:
+                    vmdata = vmfile.read()
+                    initramfs_offset = vmdata.find('\x1F\x8B\x08')
+                    if initramfs_offset == -1:
+                        err("Unable to find initramfs", False)
+                        break
+                    vmfile.seek(0)
+                    with open("%s-kernel" % filename, "wb") as kernelfile:
+                        print "  Writing kernel to: %s-kernel" % filename
+                        kernelfile.write(vmfile.read(initramfs_offset))
+                        kernelfile.close()
+                    vmfile.seek(initramfs_offset)
+                    with open("%s-initramfs.gz" % filename, "wb") as ramfsfile:
+                        print ("  Writing initramfs to: %s-initramfs.gz" %
+                               filename)
+                        ramfsfile.write(vmfile.read())
+                        ramfsfile.close()
+
 
 class GS1900FW(object):
     """Main class"""
@@ -311,21 +427,10 @@ class GS1900FW(object):
         """Class initialiser"""
         self.uboot = UBootImage()
         self.options = options
-        self.dbg("Command line arguments: %s" % self.options)
+        dbg("Command line arguments: %s" % self.options)
 
         if self.options.firmware_file:
             self.uboot.load_fw(self.options.firmware_file)
-
-    def err(self, msg, exit=True):
-        """Print an error and die"""
-        print("ERROR: %s" % msg)
-        if exit:
-            sys.exit(1)
-
-    def dbg(self, msg):
-        """Print a debugging message, if appropriate"""
-        if self.options.debug:
-            print "DEBUG: %s" % msg
 
     def parse_fw(self):
         """Parse a firmware and return a useful data structure"""
@@ -333,8 +438,7 @@ class GS1900FW(object):
         self.uboot.parse_image()
 
         if self.uboot.ih_magic != IH_MAGIC:
-            self.err("File does not appear to be a valid firmware",
-                     False)
+            err("File does not appear to be a valid firmware", False)
             return False
         else:
             return True
@@ -342,14 +446,22 @@ class GS1900FW(object):
     def do_checksums(self):
         """Validate the checksums in a file"""
         if not self.options.firmware_file:
-            self.err("No firmware file specified, see --help")
+            err("No firmware file specified, see --help")
 
         self.parse_fw()
         print self.uboot.fwinfo()
         if not self.uboot.checksums():
-            self.err("Some checksum operations failed")
+            err("Some checksum operations failed")
         else:
-            print("Checksum tests PASSED!")
+            print "Checksum tests PASSED!"
+
+    def do_extract(self):
+        """Split the firmware into parts"""
+        if not self.options.firmware_file:
+            err("No firmware file specified, see --help")
+
+        self.parse_fw()
+        self.uboot.split_fw(self.options.firmware_file)
 
 
 def main():
@@ -359,6 +471,8 @@ def main():
 
     if options.checksums:
         return gs1900fw.do_checksums()
+    elif options.extract:
+        return gs1900fw.do_extract()
 
 
 if __name__ == "__main__":
