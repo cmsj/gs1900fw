@@ -212,6 +212,9 @@ def parse_options(args=None):
                             Requires -k, -w and -r.")
 
     args = parser.parse_args(args)
+
+    if not args.info and not args.extract and not args.checksums and not args.assemble:
+        parser.print_help()
     return args
 
 
