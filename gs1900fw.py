@@ -5,9 +5,11 @@ import argparse
 import binascii
 import datetime
 import gzip
+import os
 import StringIO
 import struct
 import sys
+import time
 
 DEBUG = False
 
@@ -146,6 +148,9 @@ IH_NMLEN = 32    # Image Name Length
 
 IH_HCRC_XOR = 0x9F3FF3D7  # ZyXEL seem to XOR the ih_hcrc with this
 
+IH_LOAD_ADDR = 0x80000000
+IH_EP_ADDR = 0x8026B000
+
 
 def parse_options(args=None):
     """Parse command line arguments"""
@@ -168,6 +173,21 @@ def parse_options(args=None):
                         dest="firmware_file",
                         default=None,
                         help="Path to the firmware file")
+    parser.add_argument("-k", "--kernel",
+                        action="store",
+                        dest="kernel_file",
+                        default=None,
+                        help="Path to a bare kernel file, for -a")
+    parser.add_argument("-r", "--initramfs",
+                        action="store",
+                        dest="initramfs_file",
+                        default=None,
+                        help="Path to a gzipped cpio initramfs, for -a")
+    parser.add_argument("-l", "--fwname",
+                        action="store",
+                        dest="firmware_name",
+                        default=None,
+                        help="Name for the firmware")
     group = parser.add_mutually_exclusive_group()
     group.add_argument("-i", "--info",
                        action="store_true",
@@ -184,6 +204,12 @@ def parse_options(args=None):
                        dest="checksums",
                        default=False,
                        help="Verifies the checksums of a firmware")
+    group.add_argument("-a", "--assemble",
+                       action="store_true",
+                       dest="assemble",
+                       default=False,
+                       help="Assemble a new firmware file. \
+                            Requires -k, -w and -r.")
 
     args = parser.parse_args(args)
     return args
@@ -417,6 +443,70 @@ class UBootImage(object):
                         ramfsfile.write(vmfile.read())
                         ramfsfile.close()
 
+    def assemble(self, firmware_file, kernel_file,
+                 initramfs_file, firmware_name):
+        """Assemble a new firmware image file"""
+        self.ih_magic = IH_MAGIC
+        self.ih_time = int(time.time())
+        self.ih_load = IH_LOAD_ADDR
+        self.ih_ep = IH_EP_ADDR
+        self.ih_os = IH_OS_LINUX
+        self.ih_arch = IH_ARCH_MIPS
+        self.ih_type = IH_TYPE_KERNEL
+        self.ih_comp = IH_COMP_GZIP
+
+        padsize = 32 - len(firmware_name)
+        if padsize < 0:
+            err("Firmware name/version must be 32 characters or less")
+
+        self.ih_name = firmware_name + "\0" * padsize
+
+        print "Assembling: %s" % firmware_file
+        # Read in kernel and ramfs, concat them, gzip the result
+        objfilename = "%s-kernel-initramfs.gz" % firmware_name
+        objfile = open(objfilename, "wb")
+        gzfile = gzip.GzipFile("vmlinux_org.bin", "wb", 9, objfile)
+        with open(kernel_file, "rb") as kernel:
+            print "  Injecting: %s" % kernel_file
+            gzfile.write(kernel.read())
+        with open(initramfs_file, "rb") as ramfs:
+            print "  Injecting: %s" % initramfs_file
+            gzfile.write(ramfs.read())
+        gzfile.close()
+        objfile.close()
+
+        # Get the size of that result, put it in self.ih_size
+        objstat = os.stat(objfilename)
+        self.ih_size = objstat.st_size
+        print "  Measured image size: %d" % self.ih_size
+        print "   (bear in mind there is also 64 bytes of header)"
+
+        # Calc the CRC32 of the gzipped file, put it in self.ih_dcrc
+        with open(objfilename, "rb") as gzfile:
+            crc32 = binascii.crc32(gzfile.read()) & 0xFFFFFFFF
+            self.ih_dcrc = crc32
+
+        # Now the header is complete, calculate its CRC32
+        header_struct = struct.pack(">IIIIIBBBB32s",
+                                    self.ih_time, self.ih_size, self.ih_load,
+                                    self.ih_ep, self.ih_dcrc, self.ih_os,
+                                    self.ih_arch, self.ih_type, self.ih_comp,
+                                    self.ih_name)
+        self.ih_hcrc = binascii.crc32(header_struct) & 0xFFFFFFFF
+        self.ih_hcrc = self.ih_hcrc ^ IH_HCRC_XOR
+
+        # Write out the header file
+        with open("%s-header" % firmware_file, "wb") as header:
+            print "  Writing: %s-header" % firmware_file
+            header.write(struct.pack(">I", self.ih_magic))
+            header.write(struct.pack(">I", self.ih_hcrc))
+            header.write(header_struct)
+
+        # Write out final firmware file
+        with open(firmware_file, "wb") as firmware:
+            print "  Writing: %s" % firmware_file
+            firmware.write(open("%s-header" % firmware_file, "rb").read())
+            firmware.write(open(objfilename, "rb").read())
 
 class GS1900FW(object):
     """Main class"""
@@ -429,7 +519,7 @@ class GS1900FW(object):
         self.options = options
         dbg("Command line arguments: %s" % self.options)
 
-        if self.options.firmware_file:
+        if self.options.firmware_file and not self.options.assemble:
             self.uboot.load_fw(self.options.firmware_file)
 
     def parse_fw(self):
@@ -463,6 +553,19 @@ class GS1900FW(object):
         self.parse_fw()
         self.uboot.split_fw(self.options.firmware_file)
 
+    def do_assemble(self):
+        """Assemble a new firmware"""
+        if not self.options.firmware_file or \
+           not self.options.kernel_file or \
+           not self.options.initramfs_file or \
+           not self.options.firmware_name:
+            err("For -a you must specify -w, -k, -r and -l")
+
+        self.uboot.assemble(self.options.firmware_file,
+                            self.options.kernel_file,
+                            self.options.initramfs_file,
+                            self.options.firmware_name)
+
 
 def main():
     """Main entry point"""
@@ -473,6 +576,8 @@ def main():
         return gs1900fw.do_checksums()
     elif options.extract:
         return gs1900fw.do_extract()
+    elif options.assemble:
+        return gs1900fw.do_assemble()
 
 
 if __name__ == "__main__":
