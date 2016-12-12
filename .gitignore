@@ -1,1 +1,6 @@
 *.bix
+*.gz
+*-header
+*.bin
+*-kernel
+*-initramfs
