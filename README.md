@@ -1,4 +1,4 @@
-* ZyXEL GS1900 Firmware Tool
+= ZyXEL GS1900 Firmware Tool =
 
 by Chris Jones <cmsj@tenshu.net>
 
