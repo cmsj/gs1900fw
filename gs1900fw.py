@@ -5,8 +5,9 @@ import argparse
 import binascii
 import datetime
 import gzip
+import lzma
 import os
-import StringIO
+import io
 import struct
 import sys
 import time
@@ -220,7 +221,7 @@ def parse_options(args=None):
 
 def err(msg, shouldexit=True):
     """Print an error and die"""
-    print "ERROR: %s" % msg
+    print("ERROR: %s" % msg)
     if shouldexit:
         sys.exit(1)
 
@@ -228,7 +229,7 @@ def err(msg, shouldexit=True):
 def dbg(msg):
     """Print a debugging message, if appropriate"""
     if DEBUG:
-        print "DEBUG: %s" % msg
+        print("DEBUG: %s" % msg)
 
 
 def as_hex(value):
@@ -286,7 +287,7 @@ class UBootImage(object):
 
     def load_fw(self, filepath):
         """Load a firmware file from disk"""
-        print "Loading: %s" % filepath
+        print("Loading: %s" % filepath)
         with open(filepath, "rb") as fwfile:
             self.raw_header = fwfile.read(64)
             self.raw_image = fwfile.read()
@@ -307,10 +308,10 @@ class UBootImage(object):
         self.ih_comp = header[10]
         self.ih_name = header[11]
 
-        print("Checking file magic: Expected %s, found %s" % (
+        print(("Checking file magic: Expected %s, found %s" % (
             as_hex(IH_MAGIC),
             as_hex(self.ih_magic))
-             )
+             ))
 
     def parse_image(self):
         """Parse the image"""
@@ -341,17 +342,17 @@ class UBootImage(object):
 
         headerpart = self.raw_header[8:64]
         header_crc = (binascii.crc32(headerpart) & 0xFFFFFFFF) ^ IH_HCRC_XOR
-        print("Header checksum: Expected %s, found %s" % (
+        print(("Header checksum: Expected %s, found %s" % (
             as_hex(self.ih_hcrc),
-            as_hex(header_crc)))
+            as_hex(header_crc))))
         if self.ih_hcrc != header_crc:
             err("Header CRCs do not match", False)
             success = False
 
         image_crc = binascii.crc32(self.parts[0]) & 0xFFFFFFFF
-        print("Image checksum: Expected %s, found %s" % (
+        print(("Image checksum: Expected %s, found %s" % (
             as_hex(self.ih_dcrc),
-            as_hex(image_crc)))
+            as_hex(image_crc))))
         if self.ih_dcrc != image_crc:
             err("Image CRCs do not match", False)
             success = True
@@ -362,7 +363,7 @@ class UBootImage(object):
         """Attempt to figure out the filename of a given image part"""
         filename = None
 
-        fileobj = StringIO.StringIO(self.parts[partnum])
+        fileobj = io.StringIO(self.parts[partnum])
         gzobj = gzip.GzipFile(fileobj=fileobj, mode="rb")
         gzf = gzobj.fileobj
 
@@ -375,7 +376,7 @@ class UBootImage(object):
         _, flag, _ = struct.unpack("<BBIxx", gzf.read(8))
 
         if not flag & gzip.FNAME:
-            print "INFO: Part %d does not have a filename" % partnum
+            print("INFO: Part %d does not have a filename" % partnum)
             return filename
 
         if flag & gzip.FEXTRA:
@@ -398,11 +399,11 @@ class UBootImage(object):
 
         ext = lookup_magic(IH_COMP_EXT_LOOKUP, self.ih_comp)
 
-        for i in xrange(0, len(self.parts)):
-            print "Examining part: %d" % i
+        for i in range(0, len(self.parts)):
+            print("Examining part: %d" % i)
             filepath_part = filepath + "-part-%d.%s" % (i, ext)
             with open(filepath_part, "wb") as fwfile:
-                print "  Writing to: %s" % filepath_part
+                print("  Writing to: %s" % filepath_part)
                 fwfile.write(self.parts[i])
                 fwfile.close()
 
@@ -413,8 +414,8 @@ class UBootImage(object):
                 else:
                     filename = filepath + "-part-%d" % i
 
-                print "  Decompressing to: %s" % filename
-                fileobj = StringIO.StringIO(self.parts[i])
+                print("  Decompressing gzip to: %s" % filename)
+                fileobj = io.BytesIO(self.parts[i])
                 gzobj = gzip.GzipFile(fileobj=fileobj, mode="rb")
                 fileobj.seek(0)
                 gzobj.fileobj.seek(0)
@@ -425,24 +426,38 @@ class UBootImage(object):
                         # Almost certainly not an error, just a gzip module bug
                         partfile.write(gzobj.extrabuf[gzobj.offset -
                                                       gzobj.extrastart:])
+                        
+            elif self.ih_comp == IH_COMP_LZMA:
+                filename = filepath + "-part-%d" % i
+
+                print("  Decompressing LZMA to: %s" % filename)
+                fileobj = io.BytesIO(self.parts[i])
+                lzobj = lzma.LZMAFile(filename=fileobj, mode="rb")
+                fileobj.seek(0)
+                lzobj.seek(0)
+                with open(filename, "wb") as partfile:
+                    try:
+                        partfile.write(lzobj.read())
+                    except IOError:
+                        print("Error uncompressing LZMA portion")
 
             if i == 0:
                 # Split the vmlinux_org.bin into kernel and initramfs
                 with open(filename, "rb") as vmfile:
                     vmdata = vmfile.read()
-                    initramfs_offset = vmdata.find('\x1F\x8B\x08')
+                    initramfs_offset = vmdata.find(b'\x1F\x8B\x08')
                     if initramfs_offset == -1:
                         err("Unable to find initramfs", False)
                         break
                     vmfile.seek(0)
                     with open("%s-kernel" % filename, "wb") as kernelfile:
-                        print "  Writing kernel to: %s-kernel" % filename
+                        print("  Writing kernel to: %s-kernel" % filename)
                         kernelfile.write(vmfile.read(initramfs_offset))
                         kernelfile.close()
                     vmfile.seek(initramfs_offset)
                     with open("%s-initramfs.gz" % filename, "wb") as ramfsfile:
-                        print ("  Writing initramfs to: %s-initramfs.gz" %
-                               filename)
+                        print(("  Writing initramfs to: %s-initramfs.gz" %
+                               filename))
                         ramfsfile.write(vmfile.read())
                         ramfsfile.close()
 
@@ -464,16 +479,16 @@ class UBootImage(object):
 
         self.ih_name = firmware_name + "\0" * padsize
 
-        print "Assembling: %s" % firmware_file
+        print("Assembling: %s" % firmware_file)
         # Read in kernel and ramfs, concat them, gzip the result
         objfilename = "%s-kernel-initramfs.gz" % firmware_name
         objfile = open(objfilename, "wb")
         gzfile = gzip.GzipFile("vmlinux_org.bin", "wb", 9, objfile)
         with open(kernel_file, "rb") as kernel:
-            print "  Injecting: %s" % kernel_file
+            print("  Injecting: %s" % kernel_file)
             gzfile.write(kernel.read())
         with open(initramfs_file, "rb") as ramfs:
-            print "  Injecting: %s" % initramfs_file
+            print("  Injecting: %s" % initramfs_file)
             gzfile.write(ramfs.read())
         gzfile.close()
         objfile.close()
@@ -481,8 +496,8 @@ class UBootImage(object):
         # Get the size of that result, put it in self.ih_size
         objstat = os.stat(objfilename)
         self.ih_size = objstat.st_size
-        print "  Measured image size: %d" % self.ih_size
-        print "   (bear in mind there is also 64 bytes of header)"
+        print("  Measured image size: %d" % self.ih_size)
+        print("   (bear in mind there is also 64 bytes of header)")
 
         # Calc the CRC32 of the gzipped file, put it in self.ih_dcrc
         with open(objfilename, "rb") as gzfile:
@@ -500,14 +515,14 @@ class UBootImage(object):
 
         # Write out the header file
         with open("%s-header" % firmware_file, "wb") as header:
-            print "  Writing: %s-header" % firmware_file
+            print("  Writing: %s-header" % firmware_file)
             header.write(struct.pack(">I", self.ih_magic))
             header.write(struct.pack(">I", self.ih_hcrc))
             header.write(header_struct)
 
         # Write out final firmware file
         with open(firmware_file, "wb") as firmware:
-            print "  Writing: %s" % firmware_file
+            print("  Writing: %s" % firmware_file)
             firmware.write(open("%s-header" % firmware_file, "rb").read())
             firmware.write(open(objfilename, "rb").read())
 
@@ -542,11 +557,11 @@ class GS1900FW(object):
             err("No firmware file specified, see --help")
 
         self.parse_fw()
-        print self.uboot.fwinfo()
+        print(self.uboot.fwinfo())
         if not self.uboot.checksums():
             err("Some checksum operations failed")
         else:
-            print "Checksum tests PASSED!"
+            print("Checksum tests PASSED!")
 
     def do_extract(self):
         """Split the firmware into parts"""
